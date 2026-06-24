@@ -1,0 +1,65 @@
+# Training image for Another World.
+# Base: NVIDIA CUDA 12.4 + cuDNN, Ubuntu 22.04.
+# Built for H100 (Hopper, sm_90). Adjust TORCH_CUDA_ARCH_LIST for other GPUs.
+
+ARG CUDA_VERSION=12.4.1
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    TORCH_CUDA_ARCH_LIST="9.0" \
+    NCCL_ASYNC_ERROR_HANDLING=1
+
+# ---- System packages -------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        ffmpeg \
+        git \
+        git-lfs \
+        libgl1 \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+        ninja-build \
+        openssh-client \
+        pkg-config \
+        python3.10 \
+        python3.10-dev \
+        python3.10-venv \
+        python3-pip \
+        tini \
+        tmux \
+        wget \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.10 /usr/local/bin/python \
+    && ln -sf /usr/bin/python3.10 /usr/local/bin/python3 \
+    && python -m pip install --upgrade pip setuptools wheel
+
+# ---- PyTorch + GPU stack ---------------------------------------------------
+RUN pip install \
+        torch==2.4.1 \
+        torchvision==0.19.1 \
+        --index-url https://download.pytorch.org/whl/cu124
+
+# Optional GPU-only deps (commented; install on the cluster once nodes confirmed):
+# RUN pip install flash-attn==2.6.3 --no-build-isolation
+# RUN pip install ninja triton==3.0.0
+
+# ---- Project dependencies --------------------------------------------------
+WORKDIR /workspace/another_world
+COPY pyproject.toml ./
+COPY README.md ./
+COPY LICENSE ./
+COPY src ./src
+RUN pip install -e ".[train,data,dev]"
+
+ENV PYTHONPATH=/workspace/another_world/src
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["bash"]

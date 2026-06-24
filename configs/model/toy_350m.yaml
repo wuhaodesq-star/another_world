@@ -1,0 +1,15 @@
+# Toy 350M-parameter decoder-only Transformer used for smoke tests.
+# Real training configs (7B / 30B / 70B) live alongside this file.
+
+_target_: another_world.models.dynamics.toy.ToyTransformerConfig
+
+vocab_size: 1024
+dim: 1024
+n_layers: 24
+n_heads: 16
+n_kv_heads: 16
+ffn_mult: 4
+max_seq_len: 2048
+rope_theta: 10000.0
+dropout: 0.0
+tie_embeddings: true

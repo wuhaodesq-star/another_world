@@ -1,0 +1,36 @@
+# Slimmer image for inference / demo serving.
+ARG CUDA_VERSION=12.4.1
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        ffmpeg \
+        libgl1 \
+        libglib2.0-0 \
+        python3.10 \
+        python3.10-venv \
+        python3-pip \
+        tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.10 /usr/local/bin/python \
+    && ln -sf /usr/bin/python3.10 /usr/local/bin/python3 \
+    && python -m pip install --upgrade pip
+
+RUN pip install \
+        torch==2.4.1 \
+        --index-url https://download.pytorch.org/whl/cu124
+
+WORKDIR /workspace/another_world
+COPY pyproject.toml README.md LICENSE ./
+COPY src ./src
+RUN pip install -e "."
+
+ENV PYTHONPATH=/workspace/another_world/src
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["aw-eval", "--help"]

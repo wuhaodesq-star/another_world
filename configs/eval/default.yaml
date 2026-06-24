@@ -1,0 +1,5 @@
+# Placeholder evaluation config. Stage 5 will populate full metric suites.
+
+metrics:
+  - name: token_accuracy
+  - name: nll

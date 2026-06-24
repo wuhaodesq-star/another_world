@@ -1,0 +1,33 @@
+# Default Hydra configuration.
+# Composed from data / model / train / eval groups.
+
+defaults:
+  - _self_
+  - data: dummy
+  - model: toy_350m
+  - train: smoke
+  - eval: null
+
+seed: 42
+
+paths:
+  root: ${oryx.cwd:}
+  data_dir: ${paths.root}/data
+  output_dir: ${paths.root}/outputs
+  checkpoint_dir: ${paths.output_dir}/checkpoints
+  log_dir: ${paths.output_dir}/logs
+
+logging:
+  level: INFO
+  wandb:
+    enabled: false
+    project: another_world
+    entity: null
+    tags: ["stage0", "smoke"]
+
+hydra:
+  run:
+    dir: ${paths.output_dir}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: ${paths.output_dir}/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}

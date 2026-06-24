@@ -1,0 +1,8 @@
+# Dummy random data source for smoke tests.
+# Produces random token sequences with the toy vocabulary.
+
+_target_: another_world.data.datasets.dummy.DummyTokenDataset
+vocab_size: 1024
+seq_len: 128
+length: 256
+seed: ${seed}

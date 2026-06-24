@@ -1,0 +1,118 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "another_world"
+version = "0.0.1"
+description = "Another World: an open, general-purpose multimodal world model."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Another World Contributors" }]
+keywords = ["world-model", "multimodal", "video-generation", "pytorch"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch>=2.4.0",
+    "torchvision>=0.19.0",
+    "numpy>=1.26",
+    "einops>=0.8.0",
+    "hydra-core>=1.3.2",
+    "omegaconf>=2.3.0",
+    "pydantic>=2.7",
+    "tqdm>=4.66",
+    "rich>=13.7",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+train = [
+    "accelerate>=0.33",
+    "wandb>=0.17",
+    "webdataset>=0.2.90",
+    "transformers>=4.44",
+    "safetensors>=0.4",
+]
+data = [
+    "yt-dlp>=2024.8.6",
+    "av>=12.0",
+    "opencv-python>=4.10",
+    "scenedetect>=0.6.4",
+    "boto3>=1.34",
+    "Pillow>=10.3",
+]
+dev = [
+    "pytest>=8.2",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+    "black>=24.8",
+    "mypy>=1.11",
+    "pre-commit>=3.8",
+    "ipykernel>=6.29",
+]
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/anothersample/another_world"
+Repository = "https://github.com/anothersample/another_world"
+Issues = "https://github.com/anothersample/another_world/issues"
+
+[project.scripts]
+aw-train = "another_world.training.cli:main"
+aw-eval = "another_world.eval.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+another_world = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+extend-exclude = ["notebooks", "third_party"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "SIM", "C4"]
+ignore = ["E501", "B008", "N812"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["N802", "N803", "N806"]
+"__init__.py" = ["F401"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+ignore_missing_imports = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+check_untyped_defs = true
+exclude = ["notebooks", "third_party", "build"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra --strict-markers --strict-config"
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "gpu: requires GPU",
+    "distributed: requires multi-GPU",
+]
