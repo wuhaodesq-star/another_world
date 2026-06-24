@@ -65,9 +65,9 @@ docs = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/anothersample/another_world"
-Repository = "https://github.com/anothersample/another_world"
-Issues = "https://github.com/anothersample/another_world/issues"
+Homepage = "https://github.com/wuhaodesq-star/another_world"
+Repository = "https://github.com/wuhaodesq-star/another_world"
+Issues = "https://github.com/wuhaodesq-star/another_world/issues"
 
 [project.scripts]
 aw-train = "another_world.training.cli:main"
