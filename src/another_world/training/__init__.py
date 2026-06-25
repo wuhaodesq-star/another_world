@@ -11,6 +11,10 @@ from another_world.training.distributed_wrap import (
     WrapResult,
     wrap_model_for_distributed,
 )
+from another_world.training.dit_trainer import (
+    DiTTrainerConfig,
+    run_dit_training,
+)
 from another_world.training.multimodal import (
     MultimodalStepResult,
     MultimodalTrainerConfig,
@@ -26,6 +30,7 @@ from another_world.training.smoke import (
 
 __all__ = [
     "CheckpointMeta",
+    "DiTTrainerConfig",
     "FsdpConfig",
     "MultimodalStepResult",
     "MultimodalTrainerConfig",
@@ -36,6 +41,7 @@ __all__ = [
     "build_optimizer",
     "find_latest_checkpoint",
     "load_checkpoint",
+    "run_dit_training",
     "run_multimodal_training",
     "run_smoke_training",
     "save_checkpoint",
