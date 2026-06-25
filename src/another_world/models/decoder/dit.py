@@ -173,12 +173,17 @@ class DiTBlock(nn.Module):
 
 
 class FinalLayer(nn.Module):
-    """Project the final hidden states to per-patch pixel deltas."""
+    """Project the final hidden states to per-patch pixel deltas.
 
-    def __init__(self, dim: int, patch_size: int, out_channels: int) -> None:
+    The ``output_size`` argument is the *total* fan-out per token; for a
+    2-D ``patch x patch x C`` head pass ``patch_size**2 * C``, for a 3-D
+    ``patch_t x patch x patch x C`` head pass ``patch_t * patch**2 * C``.
+    """
+
+    def __init__(self, dim: int, output_size: int) -> None:
         super().__init__()
         self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(dim, patch_size * patch_size * out_channels, bias=True)
+        self.linear = nn.Linear(dim, output_size, bias=True)
         self.adaln = nn.Sequential(
             nn.SiLU(),
             nn.Linear(dim, 2 * dim, bias=True),
@@ -203,8 +208,9 @@ class SpatialPatchEmbed(nn.Module):
     """Project ``[B, C, T, H, W]`` -> ``[B, T*H'*W', dim]`` tokens.
 
     Treats the temporal dim as independent (each frame is patchified the
-    same way). For a small skeleton this is enough; a future revision can
-    add 3-D spatiotemporal patching like CogVideoX.
+    same way). For a small skeleton this is enough; the 3-D variant
+    (:class:`SpatiotemporalPatchEmbed`) handles full spatio-temporal
+    patches like CogVideoX.
     """
 
     def __init__(self, in_channels: int, patch_size: int, dim: int) -> None:
@@ -225,6 +231,71 @@ class SpatialPatchEmbed(nn.Module):
         x = x.view(b, t, h2 * w2, x.shape[-1])              # [B, T, P, dim]
         x = x.reshape(b, t * h2 * w2, x.shape[-1])          # [B, T*P, dim]
         return x, (t, h2, w2)
+
+
+class SpatiotemporalPatchEmbed(nn.Module):
+    """3-D patch projection: ``[B, C, T, H, W]`` -> ``[B, T'*H'*W', dim]``.
+
+    Uses a single Conv3d so each output token aggregates a
+    ``(patch_t, patch_s, patch_s)`` cube of input pixels. This is the
+    layout used by CogVideoX / Open-Sora-Plan v1.3.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        patch_t: int,
+        patch_s: int,
+        dim: int,
+    ) -> None:
+        super().__init__()
+        if patch_t < 1 or patch_s < 1:
+            raise ValueError("patch sizes must be >= 1")
+        self.patch_t = patch_t
+        self.patch_s = patch_s
+        self.proj = nn.Conv3d(
+            in_channels, dim,
+            kernel_size=(patch_t, patch_s, patch_s),
+            stride=(patch_t, patch_s, patch_s),
+        )
+
+    def forward(self, x: Tensor) -> tuple[Tensor, tuple[int, int, int]]:
+        if x.dim() != 5:
+            raise ValueError(
+                f"expected [B, C, T, H, W], got {tuple(x.shape)}"
+            )
+        b, c, t, h, w = x.shape
+        if t % self.patch_t:
+            raise ValueError(
+                f"T={t} not divisible by patch_t={self.patch_t}"
+            )
+        if h % self.patch_s or w % self.patch_s:
+            raise ValueError(
+                f"spatial size {h}x{w} not divisible by patch_s={self.patch_s}"
+            )
+        x = self.proj(x)                                # [B, dim, t', h', w']
+        t2, h2, w2 = x.shape[-3:]
+        x = x.flatten(2).transpose(1, 2)                # [B, t'*h'*w', dim]
+        return x, (t2, h2, w2)
+
+
+def unpatchify_3d(
+    x: Tensor,
+    shape: tuple[int, int, int],
+    patch_t: int,
+    patch_s: int,
+    out_channels: int,
+) -> Tensor:
+    """Inverse of :class:`SpatiotemporalPatchEmbed`."""
+
+    b, n, _ = x.shape
+    t, h, w = shape
+    if n != t * h * w:
+        raise ValueError(f"token count {n} != t*h*w = {t * h * w}")
+    x = x.view(b, t, h, w, patch_t, patch_s, patch_s, out_channels)
+    # -> [B, C, T*patch_t, H*patch_s, W*patch_s]
+    x = x.permute(0, 7, 1, 4, 2, 5, 3, 6).contiguous()
+    return x.view(b, out_channels, t * patch_t, h * patch_s, w * patch_s)
 
 
 def unpatchify(x: Tensor, shape: tuple[int, int, int], patch_size: int,
@@ -250,7 +321,8 @@ def unpatchify(x: Tensor, shape: tuple[int, int, int], patch_size: int,
 class DiTDecoderConfig:
     in_channels: int = 4
     out_channels: int = 4
-    patch_size: int = 2
+    patch_size: int = 2          # spatial patch (always)
+    patch_t: int = 1             # temporal patch; 1 == purely spatial mode
     dim: int = 256
     n_layers: int = 4
     n_heads: int = 4
@@ -264,6 +336,15 @@ class DiTDecoderConfig:
     def toy(cls, vocab_size: int = 256) -> "DiTDecoderConfig":
         return cls(
             in_channels=4, out_channels=4, patch_size=2,
+            dim=64, n_layers=2, n_heads=4, vocab_size=vocab_size,
+        )
+
+    @classmethod
+    def toy_3d(cls, vocab_size: int = 256) -> "DiTDecoderConfig":
+        """Toy 3-D variant (1 temporal patch == 2 frames at a time)."""
+
+        return cls(
+            in_channels=4, out_channels=4, patch_size=2, patch_t=2,
             dim=64, n_layers=2, n_heads=4, vocab_size=vocab_size,
         )
 
@@ -283,11 +364,21 @@ class DiTDecoder(nn.Module):
         super().__init__()
         self.config = config
 
-        self.patch_embed = SpatialPatchEmbed(
-            in_channels=config.in_channels,
-            patch_size=config.patch_size,
-            dim=config.dim,
-        )
+        if config.patch_t > 1:
+            self.patch_embed = SpatiotemporalPatchEmbed(
+                in_channels=config.in_channels,
+                patch_t=config.patch_t,
+                patch_s=config.patch_size,
+                dim=config.dim,
+            )
+            self._spatiotemporal = True
+        else:
+            self.patch_embed = SpatialPatchEmbed(
+                in_channels=config.in_channels,
+                patch_size=config.patch_size,
+                dim=config.dim,
+            )
+            self._spatiotemporal = False
         self.t_embed = TimestepEmbedder(config.dim)
         self.ctx_embed = TokenContextEmbedder(
             hidden_size=config.dim,
@@ -305,10 +396,19 @@ class DiTDecoder(nn.Module):
                 for _ in range(config.n_layers)
             ]
         )
-        self.final = FinalLayer(
-            dim=config.dim, patch_size=config.patch_size,
-            out_channels=config.out_channels,
-        )
+        # FinalLayer fan-out: patch elements * output channels.
+        if self._spatiotemporal:
+            output_size = (
+                config.patch_t
+                * config.patch_size
+                * config.patch_size
+                * config.out_channels
+            )
+        else:
+            output_size = (
+                config.patch_size * config.patch_size * config.out_channels
+            )
+        self.final = FinalLayer(dim=config.dim, output_size=output_size)
         self.apply(init_weights)
 
     def num_parameters(self) -> int:
@@ -336,6 +436,14 @@ class DiTDecoder(nn.Module):
         for block in self.blocks:
             x = block(x, cond)
         x = self.final(x, cond)
+
+        if self._spatiotemporal:
+            return unpatchify_3d(
+                x, shape=shape,
+                patch_t=self.config.patch_t,
+                patch_s=self.config.patch_size,
+                out_channels=self.config.out_channels,
+            )
         return unpatchify(
             x, shape=shape,
             patch_size=self.config.patch_size,
@@ -349,8 +457,10 @@ __all__ = [
     "DiTDecoderConfig",
     "FinalLayer",
     "SpatialPatchEmbed",
+    "SpatiotemporalPatchEmbed",
     "TimestepEmbedder",
     "TokenContextEmbedder",
     "timestep_embedding",
     "unpatchify",
+    "unpatchify_3d",
 ]

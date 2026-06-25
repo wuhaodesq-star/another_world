@@ -15,10 +15,12 @@ from another_world.models.decoder.dit import (
     DiTDecoderConfig,
     FinalLayer,
     SpatialPatchEmbed,
+    SpatiotemporalPatchEmbed,
     TimestepEmbedder,
     TokenContextEmbedder,
     timestep_embedding,
     unpatchify,
+    unpatchify_3d,
 )
 from another_world.models.decoder.samplers import (
     dpm_solver_sampler,
@@ -32,6 +34,7 @@ __all__ = [
     "DiffusionObjectiveConfig",
     "FinalLayer",
     "SpatialPatchEmbed",
+    "SpatiotemporalPatchEmbed",
     "TimestepEmbedder",
     "TokenContextEmbedder",
     "compute_diffusion_loss",
@@ -43,5 +46,6 @@ __all__ = [
     "sample_timesteps",
     "timestep_embedding",
     "unpatchify",
+    "unpatchify_3d",
     "v_prediction_loss",
 ]

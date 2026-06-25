@@ -49,6 +49,7 @@ from another_world.models.dynamics import (
     MultimodalDynamicsConfig,
     MultimodalDynamicsModel,
 )
+from another_world.tokenizers.text import build_text_tokenizer
 from another_world.tokenizers.vocab import VocabLayout
 from another_world.training.checkpoint import load_checkpoint
 from another_world.utils.logging import get_logger
@@ -77,6 +78,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--decoder-layers", type=int, default=2)
     p.add_argument("--decoder-heads", type=int, default=4)
     p.add_argument("--decoder-patch", type=int, default=2)
+    p.add_argument("--decoder-patch-t", type=int, default=1,
+                   help="temporal patch (>1 enables 3-D spatiotemporal patching)")
     p.add_argument("--decoder-channels", type=int, default=4)
     # checkpoints
     p.add_argument("--dynamics-ckpt", type=Path, default=None,
@@ -85,9 +88,14 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="checkpoint directory for the DiT decoder")
     # prompt
     p.add_argument("--text", default=None,
-                   help="natural-language text prompt (toy: hashed to ids)")
+                   help="natural-language text prompt")
     p.add_argument("--text-ids", default=None,
                    help="comma-separated explicit token ids; overrides --text")
+    p.add_argument("--text-tokenizer", default="hash",
+                   choices=["hash", "whitespace", "hf"],
+                   help="text tokenizer kind (hash is offline + dependency-free)")
+    p.add_argument("--hf-text-model", default="meta-llama/Meta-Llama-3-8B",
+                   help="HF model id when --text-tokenizer=hf")
     # rollout
     p.add_argument("--visual-frames", type=int, default=2)
     p.add_argument("--visual-h", type=int, default=4)
@@ -119,11 +127,15 @@ def _make_text_ids(args: argparse.Namespace, layout: VocabLayout) -> list[int] |
     if args.text_ids:
         return [int(x) for x in args.text_ids.split(",") if x.strip()]
     if args.text:
-        # Toy "tokenizer": hash each character into the text slab.
-        return [
-            (ord(ch) * 1315423911) % layout.text_size
-            for ch in args.text[:32]
-        ]
+        tokenizer = build_text_tokenizer(
+            kind=args.text_tokenizer,
+            vocab_size=layout.text_size,
+            hf_model=args.hf_text_model,
+            max_len=32,
+        )
+        ids = tokenizer.encode(args.text).tolist()
+        # Clamp into the local text slab range so encode_text() won't reject.
+        return [int(i) % layout.text_size for i in ids]
     return None
 
 
@@ -224,6 +236,7 @@ def main(argv: list[str] | None = None) -> int:
         in_channels=args.decoder_channels,
         out_channels=args.decoder_channels,
         patch_size=args.decoder_patch,
+        patch_t=args.decoder_patch_t,
         dim=args.decoder_dim,
         n_layers=args.decoder_layers,
         n_heads=args.decoder_heads,
