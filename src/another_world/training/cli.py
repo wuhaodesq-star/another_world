@@ -8,6 +8,7 @@ import sys
 from another_world.data.datasets import DummyTokenDataset
 from another_world.models.dynamics import ToyTransformerConfig, build_toy_transformer
 from another_world.training.smoke import SmokeTrainerConfig, run_smoke_training
+from another_world.utils.experiment import create_logger
 from another_world.utils.logging import get_logger
 
 _LOG = get_logger(__name__)
@@ -29,6 +30,23 @@ def _smoke_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--precision", type=str, default="fp32")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--logger",
+        type=str,
+        default="auto",
+        choices=["auto", "disabled", "jsonl", "wandb"],
+        help="experiment logger backend (default: auto)",
+    )
+    parser.add_argument("--wandb-project", type=str, default="another_world")
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument(
+        "--wandb-mode",
+        type=str,
+        default="online",
+        choices=["online", "offline", "disabled"],
+    )
+    parser.add_argument("--jsonl-path", type=str, default=None)
     return parser
 
 
@@ -60,7 +78,26 @@ def main(argv: list[str] | None = None) -> int:
         precision=args.precision,
         seed=args.seed,
     )
-    history = run_smoke_training(model, dataset, train_cfg)
+
+    logger = create_logger(
+        backend=args.logger,
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        run_name=args.wandb_run_name,
+        tags=["stage0", "smoke"],
+        config={
+            "model": vars(model_cfg) if hasattr(model_cfg, "__dict__") else {},
+            "train": vars(train_cfg) if hasattr(train_cfg, "__dict__") else {},
+            "cli": vars(args),
+        },
+        jsonl_path=args.jsonl_path,
+        wandb_mode=args.wandb_mode,
+    )
+
+    try:
+        history = run_smoke_training(model, dataset, train_cfg, logger=logger)
+    finally:
+        logger.finish()
 
     if not history:
         _LOG.error("No training history recorded.")

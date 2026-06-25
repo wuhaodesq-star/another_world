@@ -9,16 +9,22 @@ in [`docs/roadmap.md`](docs/roadmap.md).
 
 ## Status
 
-**Stage 0 — Scaffolding.** This repository currently contains:
+**Stage 0 — Scaffolding (complete, awaiting owner sign-off).** This repository currently contains:
 
 - Project layout and packaging (`pyproject.toml`).
 - Hydra configuration skeleton (`configs/`).
 - A 350M toy Transformer used as a smoke test (`src/another_world/models/dynamics/toy.py`).
 - Cosmos-Tokenizer wrapper for visual tokenisation
   (`src/another_world/tokenizers/visual/cosmos.py`).
-- Unit-test scaffolding (`tests/`), currently 48 passing tests.
+- Experiment logging abstraction with W&B / JSONL / disabled backends
+  (`src/another_world/utils/experiment.py`).
+- Distributed helpers + self-spawning DDP smoke
+  (`src/another_world/utils/distributed.py`, `scripts/ddp_smoke.py`).
+- Unit-test scaffolding (`tests/`), currently **63 passing tests**.
 - Docker / SLURM templates (`docker/`, `scripts/`).
 - CI workflows (`.github/workflows/`).
+
+The Gate 0 acceptance report lives at [`docs/gate0_report.md`](docs/gate0_report.md).
 
 No training weights exist yet. The full plan, including all stages 1-8 and the
 6-month MVP target, lives in [`docs/roadmap.md`](docs/roadmap.md).

@@ -17,6 +17,7 @@ from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset
 
 from another_world.utils.device import resolve_device, resolve_dtype
+from another_world.utils.experiment import ExperimentLogger, create_logger
 from another_world.utils.logging import get_logger
 
 _LOG = get_logger(__name__)
@@ -63,6 +64,7 @@ def run_smoke_training(
     model: nn.Module,
     dataset: Dataset[tuple[Tensor, Tensor]],
     config: SmokeTrainerConfig,
+    logger: ExperimentLogger | None = None,
 ) -> list[TrainStepResult]:
     """Train ``model`` on ``dataset`` for ``config.steps`` optimizer steps.
 
@@ -75,6 +77,11 @@ def run_smoke_training(
     device = resolve_device(config.device)
     dtype = resolve_dtype(config.precision)
     use_autocast = device.type == "cuda" and dtype in (torch.bfloat16, torch.float16)
+
+    owns_logger = False
+    if logger is None:
+        logger = create_logger("disabled")
+        owns_logger = True
 
     model.to(device=device)
 
@@ -99,56 +106,76 @@ def run_smoke_training(
     data_iter = iter(_infinite_loader(loader))
 
     _LOG.info(
-        "Starting smoke training: device=%s precision=%s steps=%d batch=%d",
+        "Starting smoke training: device=%s precision=%s steps=%d batch=%d "
+        "logger=%s",
         device, config.precision, config.steps, config.batch_size,
+        logger.backend,
     )
 
     model.train()
-    for step in range(config.steps):
-        t0 = time.perf_counter()
-        optim.zero_grad(set_to_none=True)
+    try:
+        for step in range(config.steps):
+            t0 = time.perf_counter()
+            optim.zero_grad(set_to_none=True)
 
-        accum_loss = 0.0
-        tokens_in_step = 0
-        for _ in range(config.grad_accum):
-            inputs, targets = next(data_iter)
-            inputs = inputs.to(device=device, non_blocking=True)
-            targets = targets.to(device=device, non_blocking=True)
-            tokens_in_step += inputs.numel()
+            accum_loss = 0.0
+            tokens_in_step = 0
+            for _ in range(config.grad_accum):
+                inputs, targets = next(data_iter)
+                inputs = inputs.to(device=device, non_blocking=True)
+                targets = targets.to(device=device, non_blocking=True)
+                tokens_in_step += inputs.numel()
 
-            if use_autocast:
-                with torch.autocast(device_type=device.type, dtype=dtype):
+                if use_autocast:
+                    with torch.autocast(device_type=device.type, dtype=dtype):
+                        out = model(inputs, targets=targets)
+                    loss = out["loss"] / config.grad_accum
+                else:
                     out = model(inputs, targets=targets)
-                loss = out["loss"] / config.grad_accum
-            else:
-                out = model(inputs, targets=targets)
-                loss = out["loss"] / config.grad_accum
-            loss.backward()
-            accum_loss += loss.item()
+                    loss = out["loss"] / config.grad_accum
+                loss.backward()
+                accum_loss += loss.item()
 
-        if config.grad_clip and config.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+            grad_norm = 0.0
+            if config.grad_clip and config.grad_clip > 0:
+                grad_norm = float(
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), config.grad_clip
+                    )
+                )
 
-        lr = _warmup_cosine_lr(step, config.lr, config.warmup_steps, config.steps)
-        for pg in optim.param_groups:
-            pg["lr"] = lr
+            lr = _warmup_cosine_lr(step, config.lr, config.warmup_steps, config.steps)
+            for pg in optim.param_groups:
+                pg["lr"] = lr
 
-        optim.step()
+            optim.step()
 
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        dt = time.perf_counter() - t0
-        tps = tokens_in_step / max(dt, 1e-6)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            dt = time.perf_counter() - t0
+            tps = tokens_in_step / max(dt, 1e-6)
 
-        if step % config.log_every == 0 or step == config.steps - 1:
-            res = TrainStepResult(step=step, loss=accum_loss, lr=lr, tokens_per_sec=tps)
-            history.append(res)
-            _LOG.info(
-                "step=%4d  loss=%.4f  lr=%.2e  tok/s=%.0f",
-                res.step, res.loss, res.lr, res.tokens_per_sec,
-            )
+            if step % config.log_every == 0 or step == config.steps - 1:
+                res = TrainStepResult(step=step, loss=accum_loss, lr=lr, tokens_per_sec=tps)
+                history.append(res)
+                logger.log(
+                    {
+                        "loss": res.loss,
+                        "lr": res.lr,
+                        "tokens_per_sec": res.tokens_per_sec,
+                        "grad_norm": grad_norm,
+                    },
+                    step=step,
+                )
+                _LOG.info(
+                    "step=%4d  loss=%.4f  lr=%.2e  tok/s=%.0f  gnorm=%.3f",
+                    res.step, res.loss, res.lr, res.tokens_per_sec, grad_norm,
+                )
 
-    return history
+        return history
+    finally:
+        if owns_logger:
+            logger.finish()
 
 
 __all__ = ["SmokeTrainerConfig", "TrainStepResult", "run_smoke_training"]
