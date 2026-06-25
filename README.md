@@ -14,7 +14,9 @@ in [`docs/roadmap.md`](docs/roadmap.md).
 - Project layout and packaging (`pyproject.toml`).
 - Hydra configuration skeleton (`configs/`).
 - A 350M toy Transformer used as a smoke test (`src/another_world/models/dynamics/toy.py`).
-- Unit-test scaffolding (`tests/`).
+- Cosmos-Tokenizer wrapper for visual tokenisation
+  (`src/another_world/tokenizers/visual/cosmos.py`).
+- Unit-test scaffolding (`tests/`), currently 48 passing tests.
 - Docker / SLURM templates (`docker/`, `scripts/`).
 - CI workflows (`.github/workflows/`).
 
