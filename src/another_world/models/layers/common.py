@@ -51,12 +51,33 @@ def build_rope_cache(
 
 
 def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    """Apply rotary embeddings to ``x`` of shape ``[B, H, T, D]``."""
+    """Apply rotary embeddings to ``x``.
+
+    Supports two layouts for ``(cos, sin)``:
+
+    - Standard 1D RoPE precomputed table: ``[T, head_dim // 2]``.
+    - Per-sample mixed RoPE buffer: ``[B, T, head_dim // 2]`` (one row per
+      batch element, used by :class:`MixedRoPE`).
+    """
 
     seq_len = x.size(-2)
-    cos = cos[:seq_len].to(dtype=x.dtype, device=x.device)
-    sin = sin[:seq_len].to(dtype=x.dtype, device=x.device)
-    # Split last dim into even/odd pairs.
+    cos = cos.to(dtype=x.dtype, device=x.device)
+    sin = sin.to(dtype=x.dtype, device=x.device)
+
+    if cos.dim() == 2:
+        cos = cos[:seq_len]
+        sin = sin[:seq_len]
+        cos = cos.unsqueeze(0).unsqueeze(0)  # [1, 1, T, half]
+        sin = sin.unsqueeze(0).unsqueeze(0)
+    elif cos.dim() == 3:
+        # [B, T, half] -> [B, 1, T, half] so it broadcasts over heads.
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+    else:
+        raise ValueError(
+            f"cos must be 2D or 3D, got shape {tuple(cos.shape)}"
+        )
+
     x1, x2 = x[..., ::2], x[..., 1::2]
     rotated_even = x1 * cos - x2 * sin
     rotated_odd = x1 * sin + x2 * cos
