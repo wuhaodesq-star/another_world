@@ -37,6 +37,12 @@ from another_world.models.dynamics.multimodal import (
     MultimodalBlock,
     MultimodalDynamicsModel,
 )
+from another_world.models.jepa import (
+    EmaShadow,
+    JEPAConfig,
+    JEPALatentPredictor,
+    jepa_loss,
+)
 from another_world.training.checkpoint import CheckpointMeta, save_checkpoint
 from another_world.utils.device import resolve_device, resolve_dtype
 from another_world.utils.experiment import ExperimentLogger, create_logger
@@ -73,6 +79,12 @@ class MultimodalTrainerConfig:
     checkpoint_keep: int = 3           # number of recent checkpoints to keep
     checkpoint_upload_uri: str | None = None  # r2://bucket/prefix
     is_main: bool = True               # rank 0 in distributed runs
+    # JEPA auxiliary loss
+    jepa_weight: float = 0.0           # 0 disables JEPA
+    jepa_ema_decay: float = 0.999
+    jepa_predictor_hidden: int = 0     # 0 -> use dim as hidden width
+    jepa_predictor_layers: int = 2
+    jepa_predictor_heads: int = 4
 
 
 @dataclass
@@ -144,9 +156,19 @@ def build_optimizer(
 ) -> torch.optim.Optimizer:
     """AdamW with weight-decay applied only to 2-D+ parameters."""
 
+    return build_optimizer_for_params(
+        list(model.parameters()), config, fused=fused,
+    )
+
+
+def build_optimizer_for_params(
+    params: list[nn.Parameter], config: MultimodalTrainerConfig, *, fused: bool
+) -> torch.optim.Optimizer:
+    """AdamW splitting params into decay (>=2D) / no-decay groups."""
+
     decay: list[nn.Parameter] = []
     nodecay: list[nn.Parameter] = []
-    for p in model.parameters():
+    for p in params:
         if not p.requires_grad:
             continue
         (decay if p.dim() >= 2 else nodecay).append(p)
@@ -204,13 +226,45 @@ def run_multimodal_training(
         except Exception as exc:  # noqa: BLE001
             _LOG.warning("torch.compile failed; continuing eager: %s", exc)
 
-    optim = build_optimizer(model, config, fused=device.type == "cuda")
+    # JEPA auxiliary head + EMA target encoder.
+    jepa_predictor: JEPALatentPredictor | None = None
+    jepa_ema: EmaShadow | None = None
+    jepa_target: MultimodalDynamicsModel | None = None
+    if config.jepa_weight > 0.0:
+        inner = model._orig_mod if hasattr(model, "_orig_mod") else model  # torch.compile
+        hidden_dim = inner.config.dim
+        jepa_cfg = JEPAConfig(
+            in_dim=hidden_dim,
+            out_dim=hidden_dim,
+            hidden_dim=config.jepa_predictor_hidden or hidden_dim,
+            n_layers=config.jepa_predictor_layers,
+            n_heads=config.jepa_predictor_heads,
+        )
+        jepa_predictor = JEPALatentPredictor(jepa_cfg).to(device=device)
+        # Frozen EMA target encoder (initialised from the model).
+        jepa_target = MultimodalDynamicsModel(inner.config).to(device=device)
+        jepa_target.load_state_dict(inner.state_dict())
+        for p in jepa_target.parameters():
+            p.requires_grad_(False)
+        jepa_ema = EmaShadow(inner, decay=config.jepa_ema_decay)
+        _LOG.info(
+            "JEPA enabled: weight=%.3f decay=%.4f predictor=%.2fM",
+            config.jepa_weight, config.jepa_ema_decay,
+            jepa_predictor.num_parameters / 1e6,
+        )
+
+    optim_params = list(model.parameters())
+    if jepa_predictor is not None:
+        optim_params += list(jepa_predictor.parameters())
+    optim = build_optimizer_for_params(
+        optim_params, config, fused=device.type == "cuda",
+    )
 
     _LOG.info(
         "Starting multimodal training: device=%s precision=%s steps=%d "
-        "grad_accum=%d logger=%s ac=%s",
+        "grad_accum=%d logger=%s ac=%s jepa=%.2f",
         device, config.precision, config.steps, config.grad_accum,
-        logger.backend, config.activation_checkpointing,
+        logger.backend, config.activation_checkpointing, config.jepa_weight,
     )
 
     history: list[MultimodalStepResult] = []
@@ -223,11 +277,14 @@ def run_multimodal_training(
             optim.zero_grad(set_to_none=True)
 
             accum_loss = 0.0
+            accum_jepa = 0.0
             tokens_in_step = 0
+            jepa_metrics: dict[str, float] = {}
             for _ in range(config.grad_accum):
                 batch = next(data_iter).to(device)
                 tokens_in_step += int(batch.tokens.numel())
 
+                need_hidden = jepa_predictor is not None
                 if use_autocast:
                     with torch.autocast(device_type=device.type, dtype=dtype):
                         out = model(
@@ -235,6 +292,7 @@ def run_multimodal_training(
                             axes=batch.axes,
                             targets=batch.targets,
                             loss_mask=batch.loss_mask,
+                            return_hidden=need_hidden,
                         )
                 else:
                     out = model(
@@ -242,16 +300,39 @@ def run_multimodal_training(
                         axes=batch.axes,
                         targets=batch.targets,
                         loss_mask=batch.loss_mask,
+                        return_hidden=need_hidden,
                     )
-                loss = out["loss"] / config.grad_accum
+
+                main_loss = out["loss"]
+                loss = main_loss
+                if jepa_predictor is not None and jepa_target is not None:
+                    with torch.no_grad():
+                        target_out = jepa_target(
+                            batch.tokens, axes=batch.axes,
+                            return_hidden=True,
+                        )
+                    aux_loss, jm = jepa_loss(
+                        jepa_predictor,
+                        student_hidden=out["hidden_states"],
+                        target_hidden=target_out["hidden_states"],
+                        mask=batch.loss_mask,
+                    )
+                    loss = main_loss + config.jepa_weight * aux_loss
+                    accum_jepa += float(aux_loss.detach())
+                    jepa_metrics = jm
+
+                loss = loss / config.grad_accum
                 loss.backward()
-                accum_loss += float(loss.detach())
+                accum_loss += float(main_loss.detach()) / config.grad_accum
 
             grad_norm = 0.0
             if config.grad_clip and config.grad_clip > 0:
+                params_to_clip = list(model.parameters())
+                if jepa_predictor is not None:
+                    params_to_clip += list(jepa_predictor.parameters())
                 grad_norm = float(
                     torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), config.grad_clip
+                        params_to_clip, config.grad_clip
                     )
                 )
 
@@ -262,6 +343,12 @@ def run_multimodal_training(
             for pg in optim.param_groups:
                 pg["lr"] = lr
             optim.step()
+
+            # JEPA: advance EMA shadow + sync target encoder.
+            if jepa_ema is not None and jepa_target is not None:
+                inner = model._orig_mod if hasattr(model, "_orig_mod") else model
+                jepa_ema.update(inner)
+                jepa_ema.copy_to(jepa_target)
 
             if device.type == "cuda":
                 torch.cuda.synchronize()
@@ -274,19 +361,22 @@ def run_multimodal_training(
                     tokens_per_sec=tps, grad_norm=grad_norm, elapsed=dt,
                 )
                 history.append(res)
-                logger.log(
-                    {
-                        "loss": res.loss,
-                        "lr": res.lr,
-                        "tokens_per_sec": res.tokens_per_sec,
-                        "grad_norm": res.grad_norm,
-                        "elapsed": res.elapsed,
-                    },
-                    step=step,
-                )
+                payload: dict[str, object] = {
+                    "loss": res.loss,
+                    "lr": res.lr,
+                    "tokens_per_sec": res.tokens_per_sec,
+                    "grad_norm": res.grad_norm,
+                    "elapsed": res.elapsed,
+                }
+                if config.jepa_weight > 0.0:
+                    payload["jepa_loss"] = accum_jepa
+                    payload.update(jepa_metrics)
+                logger.log(payload, step=step)
                 _LOG.info(
-                    "step=%4d  loss=%.4f  lr=%.2e  tok/s=%.0f  gnorm=%.3f",
+                    "step=%4d  loss=%.4f  lr=%.2e  tok/s=%.0f  gnorm=%.3f"
+                    + ("  jepa=%.4f" if config.jepa_weight > 0 else ""),
                     res.step, res.loss, res.lr, res.tokens_per_sec, res.grad_norm,
+                    *([accum_jepa] if config.jepa_weight > 0 else []),
                 )
 
             _maybe_save_checkpoint(
@@ -363,5 +453,6 @@ __all__ = [
     "MultimodalTrainerConfig",
     "apply_activation_checkpointing",
     "build_optimizer",
+    "build_optimizer_for_params",
     "run_multimodal_training",
 ]

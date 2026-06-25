@@ -94,6 +94,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--visual-w", type=int, default=4)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top-k", type=int, default=None)
+    p.add_argument("--no-kv-cache", action="store_true",
+                   help="disable the KV cache and use the O(T^2) recompute path")
     # sampler
     p.add_argument("--sampler", default="euler", choices=["euler", "dpm_solver"])
     p.add_argument("--steps", type=int, default=8)
@@ -248,6 +250,7 @@ def main(argv: list[str] | None = None) -> int:
         pixel_h=args.pixel_h,
         pixel_w=args.pixel_w,
         seed=args.seed,
+        use_kv_cache=not args.no_kv_cache,
     )
     result = generate(
         dynamics=dyn, decoder=dec, text_ids=text_ids,

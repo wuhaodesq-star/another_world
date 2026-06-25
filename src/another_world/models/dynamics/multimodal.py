@@ -295,6 +295,7 @@ class MultimodalDynamicsModel(nn.Module):
         axes: RopeAxes,
         targets: Tensor | None = None,
         loss_mask: Tensor | None = None,
+        return_hidden: bool = False,
     ) -> dict[str, Tensor]:
         """Run a forward pass.
 
@@ -307,6 +308,9 @@ class MultimodalDynamicsModel(nn.Module):
                 positions you don't want to score.
             loss_mask: optional ``[B, T]`` float mask multiplied into the
                 per-position cross entropy before averaging.
+            return_hidden: when True the returned dict also contains
+                ``hidden_states`` -- the final pre-LM-head activations
+                shaped ``[B, T, dim]``.
         """
 
         if tokens.dim() != 2:
@@ -330,6 +334,8 @@ class MultimodalDynamicsModel(nn.Module):
         logits = self.output(h)
 
         out: dict[str, Tensor] = {"logits": logits}
+        if return_hidden:
+            out["hidden_states"] = h
         if targets is not None:
             if targets.shape != tokens.shape:
                 raise ValueError(

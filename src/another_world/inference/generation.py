@@ -24,6 +24,7 @@ from typing import Callable
 import torch
 from torch import Tensor
 
+from another_world.inference.kv_cache import build_kv_cache, incremental_forward
 from another_world.models.decoder import (
     DiTDecoder,
     dpm_solver_sampler,
@@ -50,6 +51,7 @@ class GenerationConfig:
     pixel_h: int = 256
     pixel_w: int = 256
     seed: int | None = None
+    use_kv_cache: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -114,10 +116,30 @@ def rollout_visual_tokens(
 ) -> Tensor:
     """Autoregressively sample a ``[T, H, W]`` visual-token cube.
 
-    The function expects the caller to use a small enough cube that the
-    *entire* sequence fits inside the model's ``max_linear`` window;
-    no KV-cache is implemented here yet (a stage-3.3 optimisation).
+    Uses an incremental KV cache when ``config.use_kv_cache`` is True
+    (default) to bring per-step cost from ``O(T^2)`` to ``O(T)``.
+    Otherwise falls back to the naive recompute path which is useful as
+    a reference and for debugging.
     """
+
+    if config.use_kv_cache:
+        return _rollout_with_kv_cache(
+            model, text_ids=text_ids, config=config, layout=layout,
+        )
+    return _rollout_recompute(
+        model, text_ids=text_ids, config=config, layout=layout,
+    )
+
+
+@torch.no_grad()
+def _rollout_recompute(
+    model: MultimodalDynamicsModel,
+    *,
+    text_ids: list[int] | None,
+    config: GenerationConfig,
+    layout: VocabLayout,
+) -> Tensor:
+    """Reference O(T^2) rollout that re-runs the model from scratch each step."""
 
     device = next(model.parameters()).device
     vocab = VocabInfo(layout=layout)
@@ -131,46 +153,117 @@ def rollout_visual_tokens(
 
     sampled: list[int] = []
     for vi in range(total_visual):
-        # Build the partial sequence (prompt + already-sampled visual tokens).
         cur_tokens = prompt_tokens + sampled
-        cur_segments = list(segments)
-        if vi > 0:
-            cur_segments.append(("visual", {
-                "t": config.visual_frames,
-                "h": config.visual_height,
-                "w": config.visual_width,
-            }))
-            # Truncate the visual segment to vi by re-issuing the helper.
-            # axes_from_segments expands to the *full* visual cube so we
-            # rebuild the axes manually here for partial decode.
+        if vi == 0:
+            axes = axes_from_segments(segments, device=device)
+        else:
             axes = _partial_axes_after_prompt(
                 prompt_segments=segments,
                 visual_so_far=vi,
                 config=config,
                 device=device,
             )
-        else:
-            axes = axes_from_segments(cur_segments, device=device)
 
         tokens_t = torch.tensor([cur_tokens], dtype=torch.long, device=device)
         out = model(tokens_t, axes=axes)
         last_logits = out["logits"][:, -1, :]
-        # Restrict sampling to the visual slab.
-        slab_start = layout.visual_start
-        slab_end = layout.action_start
-        mask = torch.full_like(last_logits, -1e9)
-        mask[:, slab_start:slab_end] = 0.0
-        next_id = _sample_next(
-            last_logits + mask,
+        next_id = _sample_visual_token(
+            last_logits, layout=layout, config=config, generator=generator,
+        )
+        sampled.append(int(next_id))
+
+    arr = torch.tensor(sampled, dtype=torch.long) - layout.visual_start
+    return arr.view(config.visual_frames, config.visual_height, config.visual_width)
+
+
+@torch.no_grad()
+def _rollout_with_kv_cache(
+    model: MultimodalDynamicsModel,
+    *,
+    text_ids: list[int] | None,
+    config: GenerationConfig,
+    layout: VocabLayout,
+) -> Tensor:
+    """KV-cached rollout running each new token in O(prefix_len)."""
+
+    device = next(model.parameters()).device
+    vocab = VocabInfo(layout=layout)
+
+    prompt_tokens, prompt_segments = _build_prompt(text_ids, layout=layout, vocab=vocab)
+    prompt_axes = axes_from_segments(prompt_segments, device=device)
+    prompt_len = prompt_axes.modality.shape[1]
+    total_visual = config.visual_frames * config.visual_height * config.visual_width
+    max_len = prompt_len + total_visual
+
+    cache = build_kv_cache(
+        model, batch_size=1, max_len=max_len,
+        device=device, dtype=next(model.parameters()).dtype,
+    )
+
+    generator = (
+        torch.Generator(device=device).manual_seed(config.seed)
+        if config.seed is not None else None
+    )
+
+    # Prime the cache with the prompt.
+    prompt_tokens_t = torch.tensor([prompt_tokens], dtype=torch.long, device=device)
+    logits = incremental_forward(
+        model, tokens=prompt_tokens_t, axes=prompt_axes, cache=cache,
+    )
+    last_logits = logits[:, -1, :]
+
+    sampled: list[int] = []
+    for vi in range(total_visual):
+        next_id = _sample_visual_token(
+            last_logits, layout=layout, config=config, generator=generator,
+        )
+        sampled.append(int(next_id))
+        # Step in one more token (the just-sampled visual id).
+        ti = vi // (config.visual_height * config.visual_width)
+        hi = (vi // config.visual_width) % config.visual_height
+        wi = vi % config.visual_width
+        linear_pos = cache.length
+        step_tokens = torch.tensor([[next_id]], dtype=torch.long, device=device)
+        step_axes = RopeAxes(
+            modality=torch.tensor([[1]], dtype=torch.long, device=device),
+            linear=torch.tensor([[linear_pos]], dtype=torch.long, device=device),
+            t=torch.tensor([[ti]], dtype=torch.long, device=device),
+            h=torch.tensor([[hi]], dtype=torch.long, device=device),
+            w=torch.tensor([[wi]], dtype=torch.long, device=device),
+        )
+        if vi == total_visual - 1:
+            # No need to compute next logits.
+            break
+        logits = incremental_forward(
+            model, tokens=step_tokens, axes=step_axes, cache=cache,
+        )
+        last_logits = logits[:, -1, :]
+
+    arr = torch.tensor(sampled, dtype=torch.long) - layout.visual_start
+    return arr.view(config.visual_frames, config.visual_height, config.visual_width)
+
+
+def _sample_visual_token(
+    logits: Tensor,
+    *,
+    layout: VocabLayout,
+    config: GenerationConfig,
+    generator: torch.Generator | None,
+) -> int:
+    """Sample a single visual-slab token id from raw model logits."""
+
+    slab_start = layout.visual_start
+    slab_end = layout.action_start
+    mask = torch.full_like(logits, -1e9)
+    mask[:, slab_start:slab_end] = 0.0
+    return int(
+        _sample_next(
+            logits + mask,
             temperature=config.temperature,
             top_k=config.top_k,
             generator=generator,
         ).item()
-        sampled.append(int(next_id))
-
-    # Convert global ids back to *local* visual ids (subtract slab offset).
-    arr = torch.tensor(sampled, dtype=torch.long) - layout.visual_start
-    return arr.view(config.visual_frames, config.visual_height, config.visual_width)
+    )
 
 
 def _partial_axes_after_prompt(

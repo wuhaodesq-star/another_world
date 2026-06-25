@@ -197,6 +197,12 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="explicit checkpoint dir to resume from")
     p.add_argument("--auto-resume", action="store_true",
                    help="if set, auto-resume from latest under --checkpoint-dir")
+    # JEPA
+    p.add_argument("--jepa-weight", type=float, default=0.0,
+                   help="auxiliary V-JEPA loss weight (0 disables)")
+    p.add_argument("--jepa-ema-decay", type=float, default=0.999)
+    p.add_argument("--jepa-predictor-layers", type=int, default=2)
+    p.add_argument("--jepa-predictor-heads", type=int, default=4)
     return p
 
 
@@ -287,6 +293,10 @@ def main(argv: list[str] | None = None) -> int:
         checkpoint_keep=args.checkpoint_keep,
         checkpoint_upload_uri=args.checkpoint_upload_uri,
         is_main=(wrap.info.rank == 0),
+        jepa_weight=args.jepa_weight,
+        jepa_ema_decay=args.jepa_ema_decay,
+        jepa_predictor_layers=args.jepa_predictor_layers,
+        jepa_predictor_heads=args.jepa_predictor_heads,
     )
 
     # Resume (optional).
