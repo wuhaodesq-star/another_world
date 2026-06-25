@@ -96,6 +96,13 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="text tokenizer kind (hash is offline + dependency-free)")
     p.add_argument("--hf-text-model", default="meta-llama/Meta-Llama-3-8B",
                    help="HF model id when --text-tokenizer=hf")
+    p.add_argument("--first-frame", type=Path, default=None,
+                   help="path to a .pt tensor of shape [T_prefix, H', W'] (or "
+                        "[H', W']) with local visual ids; rollout conditions "
+                        "on these.")
+    p.add_argument("--action-ids", default=None,
+                   help="comma-separated local action ids for action-conditioned "
+                        "rollout")
     # rollout
     p.add_argument("--visual-frames", type=int, default=2)
     p.add_argument("--visual-h", type=int, default=4)
@@ -271,9 +278,27 @@ def main(argv: list[str] | None = None) -> int:
         cfg_scale=args.cfg_scale,
         null_token_id=args.null_token_id,
     )
+    # First-frame visual prefix (optional).
+    first_frame = None
+    if args.first_frame is not None:
+        first_frame = torch.load(
+            args.first_frame, map_location="cpu", weights_only=False,
+        )
+        if not isinstance(first_frame, torch.Tensor):
+            raise SystemExit(
+                f"--first-frame must point at a .pt tensor; got {type(first_frame)}"
+            )
+        _LOG.info("loaded first_frame: %s", tuple(first_frame.shape))
+
+    action_ids = None
+    if args.action_ids:
+        action_ids = [int(x) for x in args.action_ids.split(",") if x.strip()]
+        _LOG.info("action prefix ids: %s", action_ids)
+
     result = generate(
         dynamics=dyn, decoder=dec, text_ids=text_ids,
         layout=layout, config=cfg,
+        first_frame=first_frame, action_ids=action_ids,
     )
     _LOG.info(
         "visual tokens: %s, pixels: %s",

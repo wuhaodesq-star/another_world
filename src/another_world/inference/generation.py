@@ -54,6 +54,7 @@ class GenerationConfig:
     use_kv_cache: bool = True
     cfg_scale: float = 1.0            # 1.0 disables classifier-free guidance
     null_token_id: int | None = None  # id used for the unconditional branch
+    first_frame_frames: int = 0       # number of pre-supplied visual frames T_prefix
 
 
 # ---------------------------------------------------------------------------
@@ -61,16 +62,59 @@ class GenerationConfig:
 # ---------------------------------------------------------------------------
 
 
+def _normalize_first_frame(
+    first_frame: Tensor | None,
+    config: GenerationConfig,
+) -> Tensor | None:
+    """Validate / canonicalise the first-frame visual prefix.
+
+    Returns a tensor of shape ``[T_prefix, H', W']`` containing *local*
+    visual ids (not yet offset into the global vocabulary) or ``None``
+    when no prefix is provided.
+    """
+
+    if first_frame is None:
+        return None
+    if first_frame.dim() == 2:
+        first_frame = first_frame.unsqueeze(0)
+    if first_frame.dim() != 3:
+        raise ValueError(
+            f"first_frame must be [T_prefix, H', W'] or [H', W']; "
+            f"got {tuple(first_frame.shape)}"
+        )
+    t_prefix, h, w = first_frame.shape
+    if t_prefix >= config.visual_frames:
+        raise ValueError(
+            f"first_frame T_prefix={t_prefix} must be < visual_frames="
+            f"{config.visual_frames}"
+        )
+    if h != config.visual_height or w != config.visual_width:
+        raise ValueError(
+            f"first_frame spatial size ({h}, {w}) must match "
+            f"({config.visual_height}, {config.visual_width})"
+        )
+    return first_frame.to(torch.long)
+
+
+def _normalize_action_ids(action_ids: list[int] | Tensor | None) -> list[int] | None:
+    if action_ids is None:
+        return None
+    if isinstance(action_ids, Tensor):
+        action_ids = action_ids.view(-1).tolist()
+    return [int(x) for x in action_ids]
+
+
 def _build_prompt(
     text_ids: list[int] | None,
     *,
     layout: VocabLayout,
     vocab: VocabInfo,
+    action_ids: list[int] | None = None,
 ) -> tuple[list[int], list[tuple[str, dict]]]:
     """Construct the initial token list + axes-segment description.
 
-    Returns ``(token_ids, segments)`` where ``segments`` is in the
-    :func:`axes_from_segments` format.
+    Order: ``[BOS] [BOC text EOC] [BOA action EOA] [BOV ...]``. Each
+    optional segment may be empty.
     """
 
     tokens: list[int] = [vocab.bos_id]
@@ -83,6 +127,15 @@ def _build_prompt(
             tokens.append(layout.encode_text(int(tid)))
         segments.append(("text", {"count": len(text_ids)}))
         tokens.append(vocab.eoc_id)
+        segments.append(("special", {"count": 1}))
+
+    if action_ids:
+        tokens.append(vocab.boa_id)
+        segments.append(("special", {"count": 1}))
+        for aid in action_ids:
+            tokens.append(layout.encode_action(int(aid)))
+        segments.append(("action", {"count": len(action_ids)}))
+        tokens.append(vocab.eoa_id)
         segments.append(("special", {"count": 1}))
 
     tokens.append(vocab.bov_id)
@@ -115,6 +168,8 @@ def rollout_visual_tokens(
     text_ids: list[int] | None,
     config: GenerationConfig,
     layout: VocabLayout,
+    first_frame: Tensor | None = None,
+    action_ids: list[int] | Tensor | None = None,
 ) -> Tensor:
     """Autoregressively sample a ``[T, H, W]`` visual-token cube.
 
@@ -122,14 +177,28 @@ def rollout_visual_tokens(
     (default) to bring per-step cost from ``O(T^2)`` to ``O(T)``.
     Otherwise falls back to the naive recompute path which is useful as
     a reference and for debugging.
+
+    Args:
+        first_frame: optional ``[T_prefix, H', W']`` tensor of *local*
+            visual ids (within the visual slab) representing already-known
+            video frames; the model conditions on them and only samples
+            the remaining ``(visual_frames - T_prefix) * H' * W'`` tokens.
+        action_ids: optional action prefix (local action-slab ids) placed
+            between the caption and the BOV separator. Useful for action-
+            conditioned rollouts (Atari / robotics).
     """
+
+    first_frame = _normalize_first_frame(first_frame, config)
+    action_ids = _normalize_action_ids(action_ids)
 
     if config.use_kv_cache:
         return _rollout_with_kv_cache(
             model, text_ids=text_ids, config=config, layout=layout,
+            first_frame=first_frame, action_ids=action_ids,
         )
     return _rollout_recompute(
         model, text_ids=text_ids, config=config, layout=layout,
+        first_frame=first_frame, action_ids=action_ids,
     )
 
 
@@ -140,31 +209,40 @@ def _rollout_recompute(
     text_ids: list[int] | None,
     config: GenerationConfig,
     layout: VocabLayout,
+    first_frame: Tensor | None,
+    action_ids: list[int] | None,
 ) -> Tensor:
     """Reference O(T^2) rollout that re-runs the model from scratch each step."""
 
     device = next(model.parameters()).device
     vocab = VocabInfo(layout=layout)
 
-    prompt_tokens, segments = _build_prompt(text_ids, layout=layout, vocab=vocab)
+    prompt_tokens, segments = _build_prompt(
+        text_ids, layout=layout, vocab=vocab, action_ids=action_ids,
+    )
     total_visual = config.visual_frames * config.visual_height * config.visual_width
+    prefix_count = 0
+    prefix_tokens: list[int] = []
+    if first_frame is not None:
+        for tid in first_frame.reshape(-1).tolist():
+            prefix_tokens.append(layout.encode_visual(int(tid)))
+        prefix_count = len(prefix_tokens)
+    prompt_tokens = prompt_tokens + prefix_tokens
+
     generator = (
         torch.Generator(device=device).manual_seed(config.seed)
         if config.seed is not None else None
     )
 
     sampled: list[int] = []
-    for vi in range(total_visual):
+    for vi in range(prefix_count, total_visual):
         cur_tokens = prompt_tokens + sampled
-        if vi == 0:
-            axes = axes_from_segments(segments, device=device)
-        else:
-            axes = _partial_axes_after_prompt(
-                prompt_segments=segments,
-                visual_so_far=vi,
-                config=config,
-                device=device,
-            )
+        axes = _partial_axes_after_prompt(
+            prompt_segments=segments,
+            visual_so_far=vi,
+            config=config,
+            device=device,
+        )
 
         tokens_t = torch.tensor([cur_tokens], dtype=torch.long, device=device)
         out = model(tokens_t, axes=axes)
@@ -174,7 +252,9 @@ def _rollout_recompute(
         )
         sampled.append(int(next_id))
 
-    arr = torch.tensor(sampled, dtype=torch.long) - layout.visual_start
+    # Build the full visual cube: pre-supplied prefix + sampled remainder.
+    full = prefix_tokens + sampled
+    arr = torch.tensor(full, dtype=torch.long) - layout.visual_start
     return arr.view(config.visual_frames, config.visual_height, config.visual_width)
 
 
@@ -185,18 +265,29 @@ def _rollout_with_kv_cache(
     text_ids: list[int] | None,
     config: GenerationConfig,
     layout: VocabLayout,
+    first_frame: Tensor | None,
+    action_ids: list[int] | None,
 ) -> Tensor:
     """KV-cached rollout running each new token in O(prefix_len)."""
 
     device = next(model.parameters()).device
     vocab = VocabInfo(layout=layout)
 
-    prompt_tokens, prompt_segments = _build_prompt(text_ids, layout=layout, vocab=vocab)
+    prompt_tokens, prompt_segments = _build_prompt(
+        text_ids, layout=layout, vocab=vocab, action_ids=action_ids,
+    )
     prompt_axes = axes_from_segments(prompt_segments, device=device)
     prompt_len = prompt_axes.modality.shape[1]
-    total_visual = config.visual_frames * config.visual_height * config.visual_width
-    max_len = prompt_len + total_visual
 
+    total_visual = config.visual_frames * config.visual_height * config.visual_width
+    prefix_count = 0
+    prefix_tokens: list[int] = []
+    if first_frame is not None:
+        for tid in first_frame.reshape(-1).tolist():
+            prefix_tokens.append(layout.encode_visual(int(tid)))
+        prefix_count = len(prefix_tokens)
+
+    max_len = prompt_len + total_visual
     cache = build_kv_cache(
         model, batch_size=1, max_len=max_len,
         device=device, dtype=next(model.parameters()).dtype,
@@ -207,41 +298,60 @@ def _rollout_with_kv_cache(
         if config.seed is not None else None
     )
 
-    # Prime the cache with the prompt.
+    # 1) Prime the cache with the (text + action) prompt.
     prompt_tokens_t = torch.tensor([prompt_tokens], dtype=torch.long, device=device)
     logits = incremental_forward(
         model, tokens=prompt_tokens_t, axes=prompt_axes, cache=cache,
     )
     last_logits = logits[:, -1, :]
 
-    sampled: list[int] = []
-    for vi in range(total_visual):
-        next_id = _sample_visual_token(
-            last_logits, layout=layout, config=config, generator=generator,
-        )
-        sampled.append(int(next_id))
-        # Step in one more token (the just-sampled visual id).
+    # 2) Push the first-frame visual prefix through the cache (if any).
+    for vi in range(prefix_count):
         ti = vi // (config.visual_height * config.visual_width)
         hi = (vi // config.visual_width) % config.visual_height
         wi = vi % config.visual_width
-        linear_pos = cache.length
-        step_tokens = torch.tensor([[next_id]], dtype=torch.long, device=device)
+        prefix_tok_t = torch.tensor(
+            [[prefix_tokens[vi]]], dtype=torch.long, device=device,
+        )
         step_axes = RopeAxes(
             modality=torch.tensor([[1]], dtype=torch.long, device=device),
-            linear=torch.tensor([[linear_pos]], dtype=torch.long, device=device),
+            linear=torch.tensor([[cache.length]], dtype=torch.long, device=device),
             t=torch.tensor([[ti]], dtype=torch.long, device=device),
             h=torch.tensor([[hi]], dtype=torch.long, device=device),
             w=torch.tensor([[wi]], dtype=torch.long, device=device),
         )
+        logits = incremental_forward(
+            model, tokens=prefix_tok_t, axes=step_axes, cache=cache,
+        )
+        last_logits = logits[:, -1, :]
+
+    # 3) Autoregressively sample the remaining (total_visual - prefix_count) tokens.
+    sampled: list[int] = []
+    for vi in range(prefix_count, total_visual):
+        next_id = _sample_visual_token(
+            last_logits, layout=layout, config=config, generator=generator,
+        )
+        sampled.append(int(next_id))
         if vi == total_visual - 1:
-            # No need to compute next logits.
             break
+        ti = vi // (config.visual_height * config.visual_width)
+        hi = (vi // config.visual_width) % config.visual_height
+        wi = vi % config.visual_width
+        step_tokens = torch.tensor([[next_id]], dtype=torch.long, device=device)
+        step_axes = RopeAxes(
+            modality=torch.tensor([[1]], dtype=torch.long, device=device),
+            linear=torch.tensor([[cache.length]], dtype=torch.long, device=device),
+            t=torch.tensor([[ti]], dtype=torch.long, device=device),
+            h=torch.tensor([[hi]], dtype=torch.long, device=device),
+            w=torch.tensor([[wi]], dtype=torch.long, device=device),
+        )
         logits = incremental_forward(
             model, tokens=step_tokens, axes=step_axes, cache=cache,
         )
         last_logits = logits[:, -1, :]
 
-    arr = torch.tensor(sampled, dtype=torch.long) - layout.visual_start
+    full = prefix_tokens + sampled
+    arr = torch.tensor(full, dtype=torch.long) - layout.visual_start
     return arr.view(config.visual_frames, config.visual_height, config.visual_width)
 
 
@@ -394,11 +504,21 @@ def generate(
     text_ids: list[int] | None,
     layout: VocabLayout,
     config: GenerationConfig,
+    first_frame: Tensor | None = None,
+    action_ids: list[int] | Tensor | None = None,
 ) -> GenerationResult:
-    """End-to-end generation: rollout tokens then decode to pixels."""
+    """End-to-end generation: rollout tokens then decode to pixels.
+
+    Args:
+        first_frame: optional ``[T_prefix, H', W']`` (or ``[H', W']``) tensor
+            of local visual ids to condition on (the MVP "first frame +
+            text -> 5s video" use case).
+        action_ids: optional action prefix (local action-slab ids).
+    """
 
     tokens = rollout_visual_tokens(
         dynamics, text_ids=text_ids, config=config, layout=layout,
+        first_frame=first_frame, action_ids=action_ids,
     )
     pixels = decode_tokens_to_pixels(
         decoder, token_ids=tokens, config=config,
