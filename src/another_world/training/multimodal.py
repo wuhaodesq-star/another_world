@@ -11,6 +11,7 @@ Differences from ``smoke.py``:
 - Supports bf16 / fp16 autocast on CUDA.
 - Optional activation checkpointing (per-block) to trade compute for memory.
 - Optional gradient accumulation across micro-batches.
+- Optional periodic checkpoint saving.
 - Reads its own batches from any iterator of :class:`PackedBatch`, so the
   same trainer accepts in-memory iterators, shard-backed streams, or a
   fully distributed dataloader.
@@ -24,6 +25,7 @@ import math
 import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 import torch
@@ -35,6 +37,7 @@ from another_world.models.dynamics.multimodal import (
     MultimodalBlock,
     MultimodalDynamicsModel,
 )
+from another_world.training.checkpoint import CheckpointMeta, save_checkpoint
 from another_world.utils.device import resolve_device, resolve_dtype
 from another_world.utils.experiment import ExperimentLogger, create_logger
 from another_world.utils.logging import get_logger
@@ -64,6 +67,12 @@ class MultimodalTrainerConfig:
     compile: bool = False
     activation_checkpointing: bool = False
     seed: int = 42
+    # Checkpointing
+    checkpoint_dir: str | None = None
+    checkpoint_every: int = 0          # 0 disables periodic saves
+    checkpoint_keep: int = 3           # number of recent checkpoints to keep
+    checkpoint_upload_uri: str | None = None  # r2://bucket/prefix
+    is_main: bool = True               # rank 0 in distributed runs
 
 
 @dataclass
@@ -279,10 +288,74 @@ def run_multimodal_training(
                     "step=%4d  loss=%.4f  lr=%.2e  tok/s=%.0f  gnorm=%.3f",
                     res.step, res.loss, res.lr, res.tokens_per_sec, res.grad_norm,
                 )
+
+            _maybe_save_checkpoint(
+                model, optim, config, step=step + 1, lr=lr,
+                final=(step == config.steps - 1),
+            )
         return history
     finally:
         if owns_logger:
             logger.finish()
+
+
+def _maybe_save_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    config: MultimodalTrainerConfig,
+    *,
+    step: int,
+    lr: float,
+    final: bool,
+) -> None:
+    if not config.checkpoint_dir:
+        return
+    interval = max(config.checkpoint_every, 0)
+    should_save = final or (interval > 0 and step % interval == 0)
+    if not should_save:
+        return
+
+    directory = Path(config.checkpoint_dir) / f"step-{step:08d}"
+    meta = CheckpointMeta(
+        step=step,
+        lr=lr,
+        config={"trainer": _config_as_dict(config)},
+    )
+    save_checkpoint(
+        directory,
+        model=model,
+        optimizer=optimizer,
+        meta=meta,
+        is_main=config.is_main,
+        upload_uri=config.checkpoint_upload_uri,
+    )
+    _prune_old_checkpoints(Path(config.checkpoint_dir), keep=config.checkpoint_keep,
+                           is_main=config.is_main)
+
+
+def _config_as_dict(config: MultimodalTrainerConfig) -> dict:
+    return {
+        k: v for k, v in vars(config).items()
+        if not k.startswith("_")
+    }
+
+
+def _prune_old_checkpoints(root: Path, *, keep: int, is_main: bool) -> None:
+    if not is_main or keep <= 0 or not root.exists():
+        return
+    candidates = sorted(
+        (p for p in root.iterdir() if p.is_dir() and p.name.startswith("step-")),
+        key=lambda p: p.name,
+    )
+    excess = candidates[: max(0, len(candidates) - keep)]
+    for old in excess:
+        try:
+            import shutil
+
+            shutil.rmtree(old)
+            _LOG.info("Pruned old checkpoint %s", old)
+        except OSError as exc:
+            _LOG.warning("Failed to prune %s: %s", old, exc)
 
 
 __all__ = [

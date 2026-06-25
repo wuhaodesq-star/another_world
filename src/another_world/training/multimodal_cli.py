@@ -47,6 +47,10 @@ from another_world.training.distributed_wrap import (
     FsdpConfig,
     wrap_model_for_distributed,
 )
+from another_world.training.checkpoint import (
+    find_latest_checkpoint,
+    load_checkpoint,
+)
 from another_world.training.multimodal import (
     MultimodalTrainerConfig,
     run_multimodal_training,
@@ -180,6 +184,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wandb-project", default="another_world")
     p.add_argument("--wandb-run-name", default=None)
     p.add_argument("--jsonl-path", default=None)
+    # checkpoints
+    p.add_argument("--checkpoint-dir", default=None,
+                   help="root directory for periodic checkpoints")
+    p.add_argument("--checkpoint-every", type=int, default=0,
+                   help="save every N steps (0 disables)")
+    p.add_argument("--checkpoint-keep", type=int, default=3,
+                   help="max number of recent checkpoints to keep")
+    p.add_argument("--checkpoint-upload-uri", default=None,
+                   help="optional r2://<bucket>/<prefix> upload target")
+    p.add_argument("--resume", default=None,
+                   help="explicit checkpoint dir to resume from")
+    p.add_argument("--auto-resume", action="store_true",
+                   help="if set, auto-resume from latest under --checkpoint-dir")
     return p
 
 
@@ -265,7 +282,24 @@ def main(argv: list[str] | None = None) -> int:
         compile=args.compile,
         activation_checkpointing=args.activation_checkpointing,
         seed=args.seed,
+        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_every=args.checkpoint_every,
+        checkpoint_keep=args.checkpoint_keep,
+        checkpoint_upload_uri=args.checkpoint_upload_uri,
+        is_main=(wrap.info.rank == 0),
     )
+
+    # Resume (optional).
+    resume_path = args.resume
+    if resume_path is None and args.auto_resume and args.checkpoint_dir:
+        latest = find_latest_checkpoint(args.checkpoint_dir)
+        if latest is not None:
+            resume_path = str(latest)
+            _LOG.info("auto-resume found checkpoint: %s", resume_path)
+    if resume_path:
+        meta = load_checkpoint(resume_path, model=inner_model, optimizer=None)
+        _LOG.info("resumed from step=%d", meta.step)
+
     try:
         history = run_multimodal_training(inner_model, batches, cfg, logger=logger)
     finally:
