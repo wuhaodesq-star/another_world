@@ -52,6 +52,8 @@ class GenerationConfig:
     pixel_w: int = 256
     seed: int | None = None
     use_kv_cache: bool = True
+    cfg_scale: float = 1.0            # 1.0 disables classifier-free guidance
+    null_token_id: int | None = None  # id used for the unconditional branch
 
 
 # ---------------------------------------------------------------------------
@@ -348,16 +350,29 @@ def decode_tokens_to_pixels(
     def model_fn(x: Tensor, timesteps: Tensor, **_kwargs) -> Tensor:
         return decoder(x, timesteps, token_ids=flat_ids)
 
+    uncond_fn = None
+    if config.cfg_scale != 1.0:
+        null_id = config.null_token_id
+        if null_id is None:
+            # Default null branch: all zeros (id 0).
+            null_id = 0
+        null_ids = torch.full_like(flat_ids, null_id)
+
+        def uncond_fn(x: Tensor, timesteps: Tensor, **_kwargs) -> Tensor:  # noqa: F811
+            return decoder(x, timesteps, token_ids=null_ids)
+
+    sampler_kwargs: dict = {
+        "shape": shape,
+        "steps": config.sampler_steps,
+        "device": device,
+        "cfg_scale": config.cfg_scale,
+        "cfg_uncond_fn": uncond_fn,
+    }
+
     if config.sampler == "euler":
-        return euler_sampler(
-            model_fn, shape=shape, steps=config.sampler_steps,
-            device=device,
-        )
+        return euler_sampler(model_fn, **sampler_kwargs)
     if config.sampler == "dpm_solver":
-        return dpm_solver_sampler(
-            model_fn, shape=shape, steps=config.sampler_steps,
-            device=device,
-        )
+        return dpm_solver_sampler(model_fn, **sampler_kwargs)
     raise ValueError(f"unknown sampler '{config.sampler}'")
 
 

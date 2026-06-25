@@ -110,6 +110,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pixel-t", type=int, default=2)
     p.add_argument("--pixel-h", type=int, default=16)
     p.add_argument("--pixel-w", type=int, default=16)
+    p.add_argument("--cfg-scale", type=float, default=1.0,
+                   help="classifier-free guidance scale (>1 enables CFG)")
+    p.add_argument("--null-token-id", type=int, default=None,
+                   help="visual token id used for the unconditional branch")
     # misc
     p.add_argument("--device", default="auto")
     p.add_argument("--seed", type=int, default=0)
@@ -264,6 +268,8 @@ def main(argv: list[str] | None = None) -> int:
         pixel_w=args.pixel_w,
         seed=args.seed,
         use_kv_cache=not args.no_kv_cache,
+        cfg_scale=args.cfg_scale,
+        null_token_id=args.null_token_id,
     )
     result = generate(
         dynamics=dyn, decoder=dec, text_ids=text_ids,
