@@ -9,6 +9,7 @@ from pathlib import Path
 
 import torch
 
+from another_world.eval.i3d_fvd import FVDConfig, I3DFVD
 from another_world.eval.metrics import (
     fvd_score,
     mae,
@@ -58,6 +59,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output", type=Path, default=None,
                         help="write metrics dict to this JSON file")
+    parser.add_argument("--fvd-backend", default="pixel", choices=["pixel", "i3d"],
+                        help="FVD backend: pixel approximation or I3D wrapper")
+    parser.add_argument("--strict-i3d", action="store_true",
+                        help="fail if --fvd-backend i3d is requested but no extractor is configured")
     return parser
 
 
@@ -86,7 +91,13 @@ def main(argv: list[str] | None = None) -> int:
     if "temporal_consistency" in args.metrics:
         out["temporal_consistency"] = temporal_consistency(pred_for_metrics)
     if "fvd" in args.metrics and target_for_metrics is not None:
-        out["fvd"] = fvd_score(target_for_metrics, pred_for_metrics)
+        evaluator = I3DFVD(
+            FVDConfig(
+                backend=args.fvd_backend,
+                strict_i3d=args.strict_i3d,
+            )
+        )
+        out["fvd"] = evaluator(target_for_metrics, pred_for_metrics)
     if "vbench" in args.metrics:
         out.update(vbench_or_fallback(pred_for_metrics))
 

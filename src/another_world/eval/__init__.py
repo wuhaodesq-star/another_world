@@ -1,5 +1,6 @@
 """Evaluation suite."""
 
+from another_world.eval.i3d_fvd import FVDConfig, I3DFVD
 from another_world.eval.long_horizon import HorizonResult, evaluate_long_horizon
 from another_world.eval.metrics import (
     fvd_score,
@@ -19,7 +20,9 @@ from another_world.eval.vbench_wrapper import (
 )
 
 __all__ = [
+    "FVDConfig",
     "HorizonResult",
+    "I3DFVD",
     "VBENCH_DIMENSIONS",
     "VBenchAdapter",
     "evaluate_long_horizon",

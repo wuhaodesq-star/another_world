@@ -1,5 +1,6 @@
-"""Text tokenizer wrappers (hash / whitespace / HuggingFace BPE)."""
+"""Text tokenizer wrappers (hash / whitespace / HuggingFace BPE / CLIP)."""
 
+from another_world.tokenizers.text.clip import CLIPTextEncoder
 from another_world.tokenizers.text.encoders import (
     HFTextTokenizer,
     HashTextTokenizer,
@@ -9,6 +10,7 @@ from another_world.tokenizers.text.encoders import (
 )
 
 __all__ = [
+    "CLIPTextEncoder",
     "HFTextTokenizer",
     "HashTextTokenizer",
     "TextTokenizer",
