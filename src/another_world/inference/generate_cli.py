@@ -40,6 +40,10 @@ from pathlib import Path
 
 import torch
 
+from another_world.inference.first_frame import (
+    FirstFramePreprocessor,
+    MockFirstFrameTokenizer,
+)
 from another_world.inference.generation import (
     GenerationConfig,
     generate,
@@ -100,6 +104,23 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="path to a .pt tensor of shape [T_prefix, H', W'] (or "
                         "[H', W']) with local visual ids; rollout conditions "
                         "on these.")
+    p.add_argument("--image", type=Path, default=None,
+                   help="path to a reference image (.png/.jpg); tokenised via "
+                        "the configured visual tokenizer and used as first frame.")
+    p.add_argument("--video", type=Path, default=None,
+                   help="path to a reference video clip; tokenised and used "
+                        "as a multi-frame first-frame prefix.")
+    p.add_argument("--visual-tokenizer", default="mock",
+                   choices=["mock", "cosmos"],
+                   help="visual tokenizer used by --image / --video preprocessing.")
+    p.add_argument("--cosmos-name", default="Cosmos-1.0-Tokenizer-DV8x16x16")
+    p.add_argument("--cosmos-ckpt-dir", type=Path, default=None)
+    p.add_argument("--ref-h", type=int, default=256,
+                   help="resize height for --image / --video preprocessing")
+    p.add_argument("--ref-w", type=int, default=256,
+                   help="resize width for --image / --video preprocessing")
+    p.add_argument("--ref-max-frames", type=int, default=9,
+                   help="frames to read from --video before tokenising")
     p.add_argument("--action-ids", default=None,
                    help="comma-separated local action ids for action-conditioned "
                         "rollout")
@@ -229,6 +250,23 @@ def _maybe_load(model: torch.nn.Module, ckpt_dir: Path | None, name: str) -> Non
     _LOG.info("%s: loaded checkpoint step=%d", name, meta.step)
 
 
+def _build_visual_tokenizer(args: argparse.Namespace, layout: VocabLayout):
+    if args.visual_tokenizer == "mock":
+        return MockFirstFrameTokenizer(vocab_size=layout.visual_size)
+    if args.visual_tokenizer == "cosmos":
+        from another_world.tokenizers.visual.cosmos import CosmosVideoTokenizer
+
+        if args.cosmos_ckpt_dir is None:
+            raise SystemExit(
+                "--cosmos-ckpt-dir required when --visual-tokenizer=cosmos"
+            )
+        return CosmosVideoTokenizer.from_local(
+            args.cosmos_name, args.cosmos_ckpt_dir,
+            device="cpu", dtype=torch.float32,
+        )
+    raise SystemExit(f"unknown visual tokenizer: {args.visual_tokenizer}")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     torch.manual_seed(args.seed)
@@ -278,8 +316,13 @@ def main(argv: list[str] | None = None) -> int:
         cfg_scale=args.cfg_scale,
         null_token_id=args.null_token_id,
     )
-    # First-frame visual prefix (optional).
+    # First-frame visual prefix (optional). Three mutually-exclusive sources.
     first_frame = None
+    sources = [args.first_frame, args.image, args.video]
+    if sum(s is not None for s in sources) > 1:
+        raise SystemExit(
+            "specify at most one of --first-frame / --image / --video"
+        )
     if args.first_frame is not None:
         first_frame = torch.load(
             args.first_frame, map_location="cpu", weights_only=False,
@@ -289,6 +332,21 @@ def main(argv: list[str] | None = None) -> int:
                 f"--first-frame must point at a .pt tensor; got {type(first_frame)}"
             )
         _LOG.info("loaded first_frame: %s", tuple(first_frame.shape))
+    elif args.image is not None or args.video is not None:
+        tokenizer = _build_visual_tokenizer(args, layout)
+        pre = FirstFramePreprocessor(
+            tokenizer=tokenizer,
+            target_h=args.ref_h,
+            target_w=args.ref_w,
+        )
+        if args.image is not None:
+            first_frame = pre.from_image(args.image)
+        else:
+            first_frame = pre.from_video(args.video, max_frames=args.ref_max_frames)
+        # Clamp into the *local* visual slab range (the rollout encodes
+        # them through layout.encode_visual).
+        first_frame = first_frame % layout.visual_size
+        _LOG.info("preprocessed first_frame: %s", tuple(first_frame.shape))
 
     action_ids = None
     if args.action_ids:

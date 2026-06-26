@@ -203,6 +203,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--jepa-ema-decay", type=float, default=0.999)
     p.add_argument("--jepa-predictor-layers", type=int, default=2)
     p.add_argument("--jepa-predictor-heads", type=int, default=4)
+    # CFG training-time conditioning dropout
+    p.add_argument("--cfg-text-drop-prob", type=float, default=0.0)
+    p.add_argument("--cfg-action-drop-prob", type=float, default=0.0)
+    p.add_argument("--cfg-null-token-id", type=int, default=0)
     return p
 
 
@@ -297,6 +301,9 @@ def main(argv: list[str] | None = None) -> int:
         jepa_ema_decay=args.jepa_ema_decay,
         jepa_predictor_layers=args.jepa_predictor_layers,
         jepa_predictor_heads=args.jepa_predictor_heads,
+        cfg_text_drop_prob=args.cfg_text_drop_prob,
+        cfg_action_drop_prob=args.cfg_action_drop_prob,
+        cfg_null_token_id=args.cfg_null_token_id,
     )
 
     # Resume (optional).

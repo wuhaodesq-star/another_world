@@ -43,6 +43,8 @@ from another_world.models.jepa import (
     JEPALatentPredictor,
     jepa_loss,
 )
+from another_world.tokenizers.vocab import VocabInfo, VocabLayout
+from another_world.training.cfg_dropout import ConditioningDropout
 from another_world.training.checkpoint import CheckpointMeta, save_checkpoint
 from another_world.utils.device import resolve_device, resolve_dtype
 from another_world.utils.experiment import ExperimentLogger, create_logger
@@ -85,7 +87,10 @@ class MultimodalTrainerConfig:
     jepa_predictor_hidden: int = 0     # 0 -> use dim as hidden width
     jepa_predictor_layers: int = 2
     jepa_predictor_heads: int = 4
-
+    # Classifier-free guidance training dropout
+    cfg_text_drop_prob: float = 0.0
+    cfg_action_drop_prob: float = 0.0
+    cfg_null_token_id: int = 0
 
 @dataclass
 class MultimodalStepResult:
@@ -226,6 +231,21 @@ def run_multimodal_training(
         except Exception as exc:  # noqa: BLE001
             _LOG.warning("torch.compile failed; continuing eager: %s", exc)
 
+    cfg_dropout: ConditioningDropout | None = None
+    if config.cfg_text_drop_prob > 0.0 or config.cfg_action_drop_prob > 0.0:
+        cfg_dropout = ConditioningDropout(
+            null_token_id=config.cfg_null_token_id,
+            text_drop_prob=config.cfg_text_drop_prob,
+            action_drop_prob=config.cfg_action_drop_prob,
+            seed=config.seed,
+        )
+        _LOG.info(
+            "CFG dropout enabled: text=%.2f action=%.2f null=%d",
+            config.cfg_text_drop_prob,
+            config.cfg_action_drop_prob,
+            config.cfg_null_token_id,
+        )
+
     # JEPA auxiliary head + EMA target encoder.
     jepa_predictor: JEPALatentPredictor | None = None
     jepa_ema: EmaShadow | None = None
@@ -282,6 +302,8 @@ def run_multimodal_training(
             jepa_metrics: dict[str, float] = {}
             for _ in range(config.grad_accum):
                 batch = next(data_iter).to(device)
+                if cfg_dropout is not None:
+                    batch = cfg_dropout(batch)
                 tokens_in_step += int(batch.tokens.numel())
 
                 need_hidden = jepa_predictor is not None

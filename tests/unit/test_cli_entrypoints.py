@@ -64,6 +64,44 @@ def test_aw_generate_with_text_prompt(tmp_path: Path) -> None:
     assert out.exists()
 
 
+def test_aw_generate_with_reference_image(tmp_path: Path) -> None:
+    """--image should be tokenised by the mock visual tokenizer and used as prefix."""
+    from PIL import Image
+    import numpy as np
+
+    image = tmp_path / "ref.png"
+    arr = np.zeros((16, 16, 3), dtype=np.uint8)
+    arr[..., 1] = 255
+    Image.fromarray(arr).save(image)
+
+    out = tmp_path / "result.pt"
+    rc = generate_main([
+        "--device", "cpu",
+        "--vocab", "tiny",
+        "--preset", "toy",
+        "--visual-frames", "2",
+        "--visual-h", "2",
+        "--visual-w", "2",
+        "--steps", "2",
+        "--pixel-t", "2",
+        "--pixel-h", "8",
+        "--pixel-w", "8",
+        "--decoder-dim", "32",
+        "--decoder-layers", "2",
+        "--decoder-heads", "4",
+        "--decoder-patch", "2",
+        "--decoder-channels", "4",
+        "--image", str(image),
+        "--visual-tokenizer", "mock",
+        "--ref-h", "16",
+        "--ref-w", "16",
+        "--out", str(out),
+        "--seed", "2",
+    ])
+    assert rc == 0
+    assert out.exists()
+
+
 def test_aw_eval_writes_metrics(tmp_path: Path) -> None:
     torch.manual_seed(0)
     preds = torch.randn(2, 3, 4, 8, 8)
