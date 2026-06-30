@@ -76,6 +76,7 @@ aw-train-dit = "another_world.training.dit_cli:main"
 aw-generate = "another_world.inference.generate_cli:main"
 aw-demo = "another_world.inference.demo_cli:main"
 aw-eval = "another_world.eval.cli:main"
+aw-doctor = "another_world.utils.doctor:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

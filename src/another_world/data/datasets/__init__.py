@@ -1,6 +1,11 @@
 """Dataset implementations."""
 
 from another_world.data.datasets.dummy import DummyTokenDataset
+from another_world.data.datasets.rl_trajectory import (
+    RLTrajectory,
+    RLTrajectoryDataset,
+    trajectories_from_dicts,
+)
 from another_world.data.datasets.sample import TokenSample, VideoSample
 from another_world.data.datasets.sequence_packer import PackedBatch, SequencePacker
 from another_world.data.datasets.transforms import (
@@ -28,6 +33,8 @@ __all__ = [
     "DummyTokenDataset",
     "IterableVideoDataset",
     "PackedBatch",
+    "RLTrajectory",
+    "RLTrajectoryDataset",
     "Resize",
     "SequencePacker",
     "TemporalRandomClip",
@@ -42,4 +49,5 @@ __all__ = [
     "decode_webdataset_sample",
     "to_float_minus_one_one",
     "to_float_zero_one",
+    "trajectories_from_dicts",
 ]
